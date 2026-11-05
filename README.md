@@ -89,8 +89,11 @@ missing from it is reviewed when first seen.
 
 ## Thresholds
 
-`DefaultThresholds` hold a tool when P(outbound) + P(destructive) ≥ 0.5, and
-override a provider's own read-only label only at 0.8. They are tuned for a
+`DefaultThresholds` hold a tool when P(outbound) + P(destructive) ≥ 0.5,
+whatever the provider declared: a `readOnlyHint` comes from the same untrusted
+catalog as the description, so it cannot make a hold harder to reach. (It
+does make the read-versus-write label stricter, at 0.8, which no gate acts
+on.) The thresholds are tuned for a
 gate where a false hold costs one extra approval card and a missed hold can
 send mail from someone's account. Thresholds are calibrated to one model, so
 `jev.DefaultModel` is pinned to a version.

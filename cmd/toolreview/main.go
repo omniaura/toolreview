@@ -2,7 +2,7 @@
 // manifest of the verdicts.
 //
 //	toolreview review -in tools.json -prior verdicts.jsonl -out verdicts.jsonl
-//	toolreview gen -in verdicts.jsonl -pkg mypkg -var composioReviews -source composio -out reviews_gen.go
+//	toolreview gen -in verdicts.jsonl -pkg mypkg -var composioReviews -source composio -holds -out reviews_gen.go
 //
 // review reads OPENROUTER_API_KEY from the environment. It is incremental: a
 // tool whose prior verdict is current (same fingerprint, same policy) is
@@ -105,7 +105,7 @@ func review(ctx context.Context, args []string) error {
 
 	client := jev.New(func() string { return key }, jev.WithModel(*model),
 		jev.WithHeader("HTTP-Referer", "https://github.com/omniaura/toolreview"), jev.WithHeader("X-Title", "toolreview"))
-	reviewer := toolreview.NewReviewer(retrying{client})
+	reviewer := toolreview.NewReviewer(jev.Retry(client, 4))
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	var mu sync.Mutex
@@ -146,35 +146,6 @@ func review(ctx context.Context, args []string) error {
 	return nil
 }
 
-// retrying retries a rate-limited or failed upstream call a few times.
-type retrying struct{ c *jev.Client }
-
-func (r retrying) Choose(ctx context.Context, state any, instructions string, criteria map[string]string) (toolreview.Choice, error) {
-	var last error
-	var cost float64
-	for attempt := range 4 {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return toolreview.Choice{Cost: cost}, ctx.Err()
-			case <-time.After(time.Duration(attempt*attempt) * time.Second):
-			}
-		}
-		choice, err := r.c.Choose(ctx, state, instructions, criteria)
-		cost += choice.Cost
-		if err == nil {
-			choice.Cost = cost
-			return choice, nil
-		}
-		last = err
-		var httpErr *jev.HTTPError
-		if errors.As(err, &httpErr) && !httpErr.Retryable() {
-			break
-		}
-	}
-	return toolreview.Choice{Model: r.c.Model(), Cost: cost}, last
-}
-
 func summarize(w io.Writer, tools []toolreview.Tool, results map[string]toolreview.Verdict) {
 	type pair struct{ declared, effective toolreview.Class }
 	counts := map[pair]int{}
@@ -213,6 +184,7 @@ func gen(args []string) error {
 	pkg := fs.String("pkg", "", "package name")
 	name := fs.String("var", "reviews", "variable name")
 	source := fs.String("source", "tool", "what the verdicts are of, for the doc comment")
+	holds := fs.Bool("holds", false, "keep only verdicts that add a hold the provider's label does not (Manifest.Holds)")
 	_ = fs.Parse(args)
 	if *in == "" || *out == "" || *pkg == "" {
 		return errors.New("gen needs -in, -out and -pkg")
@@ -221,8 +193,12 @@ func gen(args []string) error {
 	if err != nil {
 		return err
 	}
+	m := toolreview.ManifestOf(verdicts)
+	if *holds {
+		m = m.Holds()
+	}
 	var b bytes.Buffer
-	if err := toolreview.WriteGo(&b, *pkg, *name, *source, toolreview.ManifestOf(verdicts)); err != nil {
+	if err := toolreview.WriteGo(&b, *pkg, *name, *source, m); err != nil {
 		return err
 	}
 	return os.WriteFile(*out, b.Bytes(), 0o644)

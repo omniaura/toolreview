@@ -429,3 +429,17 @@ func max1(n int) int {
 func round3(f float64) float64 {
 	return float64(int(f*1000+0.5)) / 1000
 }
+
+// Holds returns the entries whose review makes the tool need approval when
+// its provider's own label does not: the verdicts that change a gate's
+// decision. A compiled-in fallback usually needs only these; a tool missing
+// from it is reviewed when first seen.
+func (m Manifest) Holds() Manifest {
+	out := Manifest{Policy: m.Policy, Model: m.Model, Entries: make(map[string]Entry)}
+	for k, e := range m.Entries {
+		if Max(e.Declared, e.Class).RequiresApproval() && !e.Declared.RequiresApproval() {
+			out.Entries[k] = e
+		}
+	}
+	return out
+}

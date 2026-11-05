@@ -273,3 +273,44 @@ func truncate(b []byte, limit int) string {
 	}
 	return string(b[:limit]) + "…"
 }
+
+// Retry returns a Chooser that sends a failed call again, up to attempts
+// times in all, with a growing pause; a rejection that cannot succeed on retry
+// (a 4xx other than 429) is returned at once. The cost of every attempt is
+// reported.
+func Retry(c *Client, attempts int) toolreview.Chooser {
+	return retrying{c: c, attempts: max(1, attempts)}
+}
+
+type retrying struct {
+	c        *Client
+	attempts int
+}
+
+func (r retrying) Choose(ctx context.Context, state any, instructions string, criteria map[string]string) (toolreview.Choice, error) {
+	var last error
+	var cost float64
+	for attempt := range r.attempts {
+		if attempt > 0 {
+			t := time.NewTimer(time.Duration(attempt*attempt) * time.Second)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return toolreview.Choice{Model: r.c.model, Cost: cost}, ctx.Err()
+			case <-t.C:
+			}
+		}
+		choice, err := r.c.Choose(ctx, state, instructions, criteria)
+		cost += choice.Cost
+		if err == nil {
+			choice.Cost = cost
+			return choice, nil
+		}
+		last = err
+		var httpErr *HTTPError
+		if errors.As(err, &httpErr) && !httpErr.Retryable() {
+			break
+		}
+	}
+	return toolreview.Choice{Model: r.c.model, Cost: cost}, last
+}

@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -348,5 +349,25 @@ func TestWriteGo(t *testing.T) {
 	}
 	if strings.Index(src, "A_LIST") > strings.Index(src, "B_SEND") {
 		t.Fatal("entries must be sorted for stable diffs")
+	}
+}
+
+func TestManifestHolds(t *testing.T) {
+	m := ManifestOf([]Verdict{
+		{Key: "SEND", Class: Outbound, Declared: Write},
+		{Key: "DELETE", Class: Destructive, Declared: Destructive},
+		{Key: "LIST", Class: Read, Declared: Read},
+		{Key: "READ_THAT_POSTS", Class: Outbound, Declared: Read},
+		{Key: "READ_THAT_WRITES", Class: Write, Declared: Read},
+		{Key: "NEW_SEND", Class: Outbound},
+	})
+	h := m.Holds()
+	got := make([]string, 0, len(h.Entries))
+	for k := range h.Entries {
+		got = append(got, k)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != "NEW_SEND,READ_THAT_POSTS,SEND" || h.Policy != m.Policy {
+		t.Fatalf("holds = %v", got)
 	}
 }

@@ -39,7 +39,7 @@ import (
 // Policy names the prompt, labels and thresholds a verdict was produced
 // under. Bump it when any of them changes; every stored verdict then reads as
 // stale and is reviewed again.
-const Policy = "toolreview/2026-11-05.1"
+const Policy = "toolreview/2026-11-05.2"
 
 // Class is what one successful call of a tool does.
 type Class string
@@ -117,6 +117,7 @@ type Tool struct {
 // and one tool with a pathological schema cannot dominate a review.
 const (
 	maxDescriptionRunes = 1500
+	maxNameRunes        = 120
 	maxArgumentRunes    = 200
 	maxArguments        = 40
 	maxEnumValues       = 8
@@ -150,9 +151,9 @@ type Argument struct {
 // StateOf returns what the model reads for t.
 func StateOf(t Tool) State {
 	return State{Tool: StateTool{
-		Name:        strings.TrimSpace(t.Name),
-		Title:       strings.TrimSpace(t.Title),
-		App:         strings.TrimSpace(t.App),
+		Name:        clip(strings.TrimSpace(t.Name), maxNameRunes),
+		Title:       clip(strings.TrimSpace(t.Title), maxNameRunes),
+		App:         clip(strings.TrimSpace(t.App), maxNameRunes),
 		Description: clip(strings.TrimSpace(t.Description), maxDescriptionRunes),
 		Arguments:   SummarizeSchema(t.InputSchema),
 	}}

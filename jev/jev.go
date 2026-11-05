@@ -36,6 +36,9 @@ const (
 	maxQuestions          = 32
 )
 
+// ErrNotConfigured means the client has no API key. Retrying cannot help.
+var ErrNotConfigured = errors.New("jev: API key is not configured")
+
 // ErrNoAnswer means the response did not answer the question asked.
 var ErrNoAnswer = errors.New("jev: no answer for question")
 
@@ -174,11 +177,11 @@ type wireAnswer struct {
 // it did not offer.
 func (c *Client) Ask(ctx context.Context, state any, questions map[string]Question) (Batch, error) {
 	if c == nil || c.apiKey == nil {
-		return Batch{}, errors.New("jev: client is not configured")
+		return Batch{}, ErrNotConfigured
 	}
 	key := strings.TrimSpace(c.apiKey())
 	if key == "" {
-		return Batch{}, errors.New("jev: API key is not configured")
+		return Batch{}, ErrNotConfigured
 	}
 	if len(questions) == 0 || len(questions) > maxQuestions {
 		return Batch{}, fmt.Errorf("jev: one to %d questions required", maxQuestions)
@@ -279,6 +282,9 @@ func truncate(b []byte, limit int) string {
 // (a 4xx other than 429) is returned at once. The cost of every attempt is
 // reported.
 func Retry(c *Client, attempts int) toolreview.Chooser {
+	if c == nil {
+		c = &Client{}
+	}
 	return retrying{c: c, attempts: max(1, attempts)}
 }
 
@@ -291,6 +297,9 @@ func (r retrying) Choose(ctx context.Context, state any, instructions string, cr
 	var last error
 	var cost float64
 	for attempt := range r.attempts {
+		if err := ctx.Err(); err != nil {
+			return toolreview.Choice{Model: r.c.model, Cost: cost}, err
+		}
 		if attempt > 0 {
 			t := time.NewTimer(time.Duration(attempt*attempt) * time.Second)
 			select {
@@ -308,7 +317,7 @@ func (r retrying) Choose(ctx context.Context, state any, instructions string, cr
 		}
 		last = err
 		var httpErr *HTTPError
-		if errors.As(err, &httpErr) && !httpErr.Retryable() {
+		if errors.Is(err, ErrNotConfigured) || errors.Is(err, ErrNoAnswer) || (errors.As(err, &httpErr) && !httpErr.Retryable()) {
 			break
 		}
 	}

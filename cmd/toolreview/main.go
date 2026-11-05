@@ -90,18 +90,26 @@ func review(ctx context.Context, args []string) error {
 
 	results := make(map[string]toolreview.Verdict, len(tools))
 	var todo []toolreview.Tool
+	reused := 0
 	for _, t := range tools {
-		if v, ok := previous[t.Key]; ok && v.Current(t) {
+		v, ok := previous[t.Key]
+		if ok {
+			// Kept even when stale: a review that fails, is cut by -limit or
+			// -max-cost, or never starts must not drop the prior hold. A
+			// successful review overwrites it.
 			v.Declared = t.Declared
 			results[t.Key] = v
-			continue
+			if v.Current(t) {
+				reused++
+				continue
+			}
 		}
 		todo = append(todo, t)
 	}
 	if *limit > 0 && len(todo) > *limit {
 		todo = todo[:*limit]
 	}
-	fmt.Fprintf(os.Stderr, "%d tools, %d reused, %d to review with %s\n", len(tools), len(results), len(todo), *model)
+	fmt.Fprintf(os.Stderr, "%d tools, %d reused, %d to review with %s\n", len(tools), reused, len(todo), *model)
 
 	client := jev.New(func() string { return key }, jev.WithModel(*model),
 		jev.WithHeader("HTTP-Referer", "https://github.com/omniaura/toolreview"), jev.WithHeader("X-Title", "toolreview"))

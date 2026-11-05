@@ -3,6 +3,8 @@ package toolreview
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"go/parser"
@@ -36,7 +38,7 @@ func TestAdopt(t *testing.T) {
 		{"declared read stays read on weak doubt", Read, p(0.4, 0.3, 0.2, 0.1), Read},
 		{"declared read that writes", Read, p(0.1, 0.75, 0.1, 0.05), Write},
 		{"declared read that sends", Read, p(0.05, 0.1, 0.8, 0.05), Outbound},
-		{"declared read, risk below override bar", Read, p(0.1, 0.2, 0.6, 0.1), Write},
+		{"a read-only hint does not raise the hold bar", Read, p(0.1, 0.2, 0.6, 0.1), Outbound},
 	}
 	for _, c := range cases {
 		if got := th.Adopt(c.declared, c.probs); got != c.want {
@@ -45,20 +47,63 @@ func TestAdopt(t *testing.T) {
 	}
 }
 
-func TestEffectiveNeverLowersTheProvider(t *testing.T) {
-	for _, declared := range append([]Class{Unknown}, Classes...) {
-		for _, reviewed := range Classes {
-			v := Verdict{Declared: declared, Class: reviewed}
-			if v.Effective().rank() < declared.rank() || v.Effective().rank() < reviewed.rank() {
-				t.Fatalf("Effective(%s, %s) = %s", declared, reviewed, v.Effective())
+// A review can only raise a tool. Over a grid of answers: the enforced class
+// is never below the provider's label, and a provider's read-only label never
+// yields fewer holds than no label at all.
+func TestReviewNeverLowersCaution(t *testing.T) {
+	steps := []float64{0, 0.1, 0.25, 0.4, 0.5, 0.6, 0.8, 1}
+	checked := 0
+	for _, r := range steps {
+		for _, w := range steps {
+			for _, o := range steps {
+				d := 1 - r - w - o
+				if d < -1e-9 {
+					continue
+				}
+				probs := map[string]float64{"read": r, "write": w, "outbound": o, "destructive": max(d, 0)}
+				f := &fakeChooser{answer: func(State) (map[string]float64, error) { return probs, nil }}
+				rev := NewReviewer(f)
+				held := map[Class]bool{}
+				for _, declared := range append([]Class{Unknown}, Classes...) {
+					v, err := rev.Review(t.Context(), Tool{Key: "k", Name: "n", Declared: declared})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if v.Effective().rank() < declared.rank() {
+						t.Fatalf("%v declared %s: effective %s", probs, declared, v.Effective())
+					}
+					held[declared] = v.RequiresApproval()
+					checked++
+				}
+				if held[Unknown] && !held[Read] {
+					t.Fatalf("%v: a read-only hint released a hold", probs)
+				}
 			}
 		}
 	}
-	if (Verdict{Declared: Destructive, Class: Read}).RequiresApproval() != true {
-		t.Fatal("a provider's destructive label must hold whatever the review says")
+	if checked < 100 {
+		t.Fatalf("grid covered only %d reviews", checked)
 	}
-	if !(Verdict{Declared: Write, Class: Outbound}).Raised() || (Verdict{Declared: Unknown, Class: Outbound}).Raised() {
-		t.Fatal("Raised is only for a provider label the review overrides")
+}
+
+// policyDigest pins what Policy names. If this test fails, the prompt,
+// labels or thresholds changed: bump Policy, then update the digest.
+const policyDigest = "f782f3ee71f0a814"
+
+func TestPolicyNamesThePrompt(t *testing.T) {
+	b, _ := json.Marshal(struct {
+		Instructions string
+		Criteria     map[string]string
+		Thresholds   Thresholds
+	}{Instructions, Criteria(), DefaultThresholds})
+	sum := sha256.Sum256(b)
+	if got := hex.EncodeToString(sum[:8]); got != policyDigest {
+		t.Fatalf("prompt digest %s != %s: bump Policy (%s) and update policyDigest", got, policyDigest, Policy)
+	}
+	c := Criteria()
+	c["read"] = "mutated"
+	if Criteria()["read"] == "mutated" {
+		t.Fatal("Criteria must hand out a copy")
 	}
 }
 
@@ -244,7 +289,7 @@ func TestCatalogLookupQueueAndDrain(t *testing.T) {
 	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	reply := Tool{Key: "OUTLOOK_REPLY_EMAIL", Name: "OUTLOOK_REPLY_EMAIL", Description: "Reply", Declared: Write}
 	draft := Tool{Key: "OUTLOOK_CREATE_DRAFT", Name: "OUTLOOK_CREATE_DRAFT", Description: "Draft", Declared: Write}
-	fallback := ManifestOf([]Verdict{{Key: draft.Key, Fingerprint: Fingerprint(draft), Class: Write, Declared: Write}})
+	fallback := ManifestOf([]Verdict{{Key: draft.Key, Fingerprint: Fingerprint(draft), Policy: Policy, Class: Write, Declared: Write}})
 	c := NewCatalog(NewReviewer(f), store, WithFallback("composio", fallback), WithClock(func() time.Time { return now }))
 
 	got := c.Verdicts(t.Context(), "composio", []Tool{reply, draft})
@@ -308,18 +353,121 @@ func TestCatalogDegradesWhenTheStoreFails(t *testing.T) {
 	}
 }
 
-func TestDrainRetriesThenGivesUp(t *testing.T) {
+func TestFailingReviewBacksOff(t *testing.T) {
 	f := &fakeChooser{answer: func(State) (map[string]float64, error) { return nil, errors.New("upstream 503") }}
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	c := NewCatalog(NewReviewer(f), nil, WithClock(func() time.Time { return now }))
+	tool := Tool{Key: "A", Name: "A"}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		c.Verdicts(t.Context(), "s", []Tool{tool})
+		if stats := c.Drain(t.Context(), 10, 1); stats.Failed != 1 {
+			t.Fatalf("attempt %d: %#v", attempt, stats)
+		}
+		// The request path cannot re-queue it inside the backoff.
+		c.Verdicts(t.Context(), "s", []Tool{tool})
+		c.Enqueue("s", tool)
+		if c.Pending() != 0 {
+			t.Fatalf("attempt %d: re-queued inside its backoff", attempt)
+		}
+		now = now.Add(time.Duration(attempt)*time.Minute + time.Second)
+	}
+	if f.calls != maxAttempts {
+		t.Fatalf("calls = %d", f.calls)
+	}
+	// The request path honours the backoff too: no model call.
+	if _, err := c.Review(t.Context(), "s", tool); !errors.Is(err, ErrBackoff) || f.calls != maxAttempts {
+		t.Fatalf("Review during backoff: err=%v calls=%d", err, f.calls)
+	}
+	c.Enqueue("s", tool)
+	if c.Pending() != 0 {
+		t.Fatal("after maxAttempts the tool waits failedBackoff")
+	}
+	changed := tool
+	changed.Description = "now different"
+	c.Enqueue("s", changed)
+	if c.Pending() != 1 {
+		t.Fatal("a changed tool is retried at once")
+	}
+}
+
+func TestCancelledReviewIsNotAFailure(t *testing.T) {
+	f := &fakeChooser{answer: func(State) (map[string]float64, error) { return nil, context.DeadlineExceeded }}
 	c := NewCatalog(NewReviewer(f), nil)
-	c.Enqueue("s", Tool{Key: "A", Name: "A"})
-	for i := range maxAttempts {
-		stats := c.Drain(t.Context(), 10, 1)
-		if stats.Failed != 1 {
-			t.Fatalf("attempt %d: %#v", i, stats)
+	tool := Tool{Key: "A", Name: "A"}
+	for range maxAttempts + 1 {
+		c.Enqueue("s", tool)
+		c.Drain(t.Context(), 10, 1)
+		if _, err := c.Review(t.Context(), "s", tool); err == nil {
+			t.Fatal("review should fail")
 		}
 	}
-	if c.Pending() != 0 || f.calls != maxAttempts {
-		t.Fatalf("pending=%d calls=%d", c.Pending(), f.calls)
+	c.mu.Lock()
+	n := len(c.failures)
+	c.mu.Unlock()
+	if n != 0 || c.Pending() != 1 {
+		t.Fatalf("a cancelled review was counted as a failure: failures=%d pending=%d", n, c.Pending())
+	}
+}
+
+func TestStaleStoreVerdictDoesNotReplaceCachedHold(t *testing.T) {
+	store := newMemStore()
+	tool := Tool{Key: "A", Name: "A", Description: "v2"}
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	c := NewCatalog(nil, store, WithClock(func() time.Time { return now }),
+		WithFallback("s", ManifestOf([]Verdict{{Key: "A", Fingerprint: "v1", Policy: Policy, Class: Outbound}})))
+	c.mu.Lock()
+	c.remember(catalogKey{"s", "A"}, Verdict{Key: "A", Fingerprint: "v1", Policy: Policy, Class: Outbound})
+	c.mu.Unlock()
+	store.rows["s/A"] = Verdict{Key: "A", Fingerprint: "v0", Policy: Policy, Class: Write}
+	if got := c.Verdicts(t.Context(), "s", []Tool{tool}); !got["A"].RequiresApproval() || !got["A"].Stale {
+		t.Fatalf("got %#v", got)
+	}
+}
+
+func TestEvictionKeepsHolds(t *testing.T) {
+	c := NewCatalog(nil, nil, WithLimits(0, 8))
+	c.mu.Lock()
+	for i := range 8 {
+		cls := Write
+		if i%4 == 0 {
+			cls = Outbound
+		}
+		c.remember(catalogKey{"s", string(rune('a' + i))}, Verdict{Class: cls})
+	}
+	c.remember(catalogKey{"s", "new"}, Verdict{Class: Read})
+	holds := 0
+	for _, v := range c.cache {
+		if v.Class == Outbound {
+			holds++
+		}
+	}
+	c.mu.Unlock()
+	if holds != 2 || len(c.cache) > 8 {
+		t.Fatalf("holds=%d size=%d", holds, len(c.cache))
+	}
+}
+
+func TestManifestKeepsTheVerdictsPolicy(t *testing.T) {
+	old := ManifestOf([]Verdict{{Key: "A", Policy: "toolreview/old", Class: Outbound}})
+	if old.Policy != "toolreview/old" {
+		t.Fatalf("policy = %q", old.Policy)
+	}
+	mixed := ManifestOf([]Verdict{
+		{Key: "A", Policy: Policy, Fingerprint: Fingerprint(Tool{Name: "A"}), Class: Outbound},
+		{Key: "C", Policy: Policy, Fingerprint: Fingerprint(Tool{Name: "C"}), Class: Read},
+		{Key: "B", Policy: "toolreview/old", Fingerprint: Fingerprint(Tool{Name: "B"}), Class: Write},
+	})
+	if mixed.Policy != Policy || mixed.Entries["B"].Policy != "toolreview/old" || mixed.Entries["A"].Policy != "" {
+		t.Fatalf("mixed = %#v", mixed)
+	}
+	a, _ := mixed.verdict("A")
+	b, _ := mixed.verdict("B")
+	if !a.Current(Tool{Name: "A"}) || b.Current(Tool{Name: "B"}) {
+		t.Fatal("staleness must be per entry: current entries stay current, old ones read stale")
+	}
+	var src bytes.Buffer
+	if err := WriteGo(&src, "x", "m", "test", mixed); err != nil || !strings.Contains(src.String(), `"B": {Policy: "toolreview/old", `) {
+		t.Fatalf("generated per-entry policy missing: %v\n%s", err, src.String())
 	}
 }
 
@@ -327,7 +475,7 @@ func TestWriteGo(t *testing.T) {
 	m := ManifestOf([]Verdict{
 		{Key: "B_SEND", Fingerprint: "fb", Policy: Policy, Model: "typesafe/jev-1.13", Class: Outbound, Declared: Write,
 			Probabilities: p(0, 0.1, 0.8766, 0.0234)},
-		{Key: "A_LIST", Fingerprint: "fa", Class: Read, Declared: Read},
+		{Key: "A_LIST", Fingerprint: "fa", Policy: Policy, Model: "typesafe/jev-1.13", Class: Read, Declared: Read},
 	})
 	var b bytes.Buffer
 	if err := WriteGo(&b, "reviews", "composioReviews", "Composio", m); err != nil {
@@ -339,8 +487,8 @@ func TestWriteGo(t *testing.T) {
 	}
 	for _, want := range []string{
 		"// Code generated by toolreview gen; DO NOT EDIT.",
-		`"A_LIST": {"fa", toolreview.Read, toolreview.Read, 0},`,
-		`"B_SEND": {"fb", toolreview.Outbound, toolreview.Write, 0.9},`,
+		`"A_LIST": {Fingerprint: "fa", Class: toolreview.Read, Declared: toolreview.Read, Risk: 0},`,
+		`"B_SEND": {Fingerprint: "fb", Class: toolreview.Outbound, Declared: toolreview.Write, Risk: 0.9},`,
 		`Model:  "typesafe/jev-1.13"`,
 	} {
 		if !strings.Contains(src, want) {

@@ -35,8 +35,17 @@ const Instructions = "The state describes one tool that an AI assistant can call
 	"Decide what a single successful call of this tool does. " +
 	"If it can do several of these things depending on its arguments, choose the most consequential one it can do."
 
-// Criteria are the labels a review chooses between.
-var Criteria = map[string]string{
+// Criteria returns the labels a review chooses between. It is a fresh copy
+// each call, so no caller can change what every other review asks.
+func Criteria() map[string]string {
+	out := make(map[string]string, len(criteria))
+	for k, v := range criteria {
+		out[k] = v
+	}
+	return out
+}
+
+var criteria = map[string]string{
 	string(Read): "Only looks up, lists, searches, counts, downloads or reads information. " +
 		"Changes nothing anywhere, and nobody else is sent anything or notified.",
 	string(Write): "Creates or changes something that only the person or their own private workspace sees, and that is easy to change back: " +
@@ -49,11 +58,15 @@ var Criteria = map[string]string{
 
 // Thresholds turn probabilities into an adopted class.
 type Thresholds struct {
-	// Hold is the probability of outbound+destructive at which a tool the
-	// provider labels a write (or does not label) is held.
+	// Hold is the probability of outbound+destructive at which a tool is
+	// held. It is the same whatever the provider declared: a readOnlyHint comes
+	// from the same untrusted catalog as the description, so it must not make
+	// a hold harder to reach.
 	Hold float64
-	// OverrideRead is the stricter bar for overriding a provider's own
-	// read-only label: both for holding it and for calling it a write.
+	// OverrideRead is the probability of write or worse at which a tool its
+	// provider calls read-only is recorded as a write. It is deliberately
+	// stricter than Read, so a weak doubt does not relabel a provider's read;
+	// it never affects holds.
 	OverrideRead float64
 	// Read is the probability of read at which an unlabelled tool is called
 	// a read. Below it, it is a write.
@@ -89,13 +102,13 @@ func (r *Reviewer) Review(ctx context.Context, t Tool) (Verdict, error) {
 	if t.Key == "" || t.Name == "" {
 		return Verdict{}, errors.New("toolreview: a tool needs a key and a name")
 	}
-	choice, err := r.Chooser.Choose(ctx, StateOf(t), Instructions, Criteria)
+	choice, err := r.Chooser.Choose(ctx, StateOf(t), Instructions, Criteria())
 	if err != nil {
-		return Verdict{}, fmt.Errorf("toolreview: review %s: %w", t.Key, err)
+		return Verdict{Declared: t.Declared, Cost: choice.Cost}, fmt.Errorf("toolreview: review %s: %w", t.Key, err)
 	}
 	probs, err := validProbabilities(choice.Probabilities)
 	if err != nil {
-		return Verdict{Cost: choice.Cost}, fmt.Errorf("%w for %s: %v", ErrInvalidAnswer, t.Key, err)
+		return Verdict{Declared: t.Declared, Cost: choice.Cost}, fmt.Errorf("%w for %s: %v", ErrInvalidAnswer, t.Key, err)
 	}
 	now := time.Now
 	if r.Now != nil {
@@ -121,33 +134,29 @@ func (r *Reviewer) thresholds() Thresholds {
 	return r.Thresholds
 }
 
-// Adopt turns probabilities into a class, given what the provider declared.
-// The result can be below the declared class; Verdict.Effective takes the
-// maximum, so enforcement never drops below the provider's label.
+// Adopt turns probabilities into a class. Whether a tool is held depends
+// only on the probabilities; what the provider declared decides only between
+// read and write, which no gate acts on. The result can be below the declared
+// class; Verdict.Effective takes the maximum, so enforcement never drops below
+// the provider's label.
 func (th Thresholds) Adopt(declared Class, p map[Class]float64) Class {
 	risk := p[Outbound] + p[Destructive]
-	risky := Outbound
-	if p[Destructive] > p[Outbound] {
-		risky = Destructive
+	if risk >= th.Hold {
+		if p[Destructive] > p[Outbound] {
+			return Destructive
+		}
+		return Outbound
 	}
 	if declared == Read {
-		switch {
-		case risk >= th.OverrideRead:
-			return risky
-		case risk+p[Write] >= th.OverrideRead:
+		if risk+p[Write] >= th.OverrideRead {
 			return Write
-		default:
-			return Read
 		}
-	}
-	switch {
-	case risk >= th.Hold:
-		return risky
-	case p[Read] >= th.Read:
 		return Read
-	default:
-		return Write
 	}
+	if p[Read] >= th.Read {
+		return Read
+	}
+	return Write
 }
 
 func validProbabilities(in map[string]float64) (map[Class]float64, error) {

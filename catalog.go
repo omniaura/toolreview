@@ -2,6 +2,7 @@ package toolreview
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -18,6 +19,8 @@ type Store interface {
 // in, so a catalog has verdicts before its first review and while the model or
 // the database is unreachable.
 type Entry struct {
+	// Policy is the entry's policy when it differs from the manifest's.
+	Policy      string
 	Fingerprint string
 	Class       Class
 	Declared    Class
@@ -32,14 +35,37 @@ type Manifest struct {
 	Entries map[string]Entry
 }
 
-// ManifestOf builds a manifest from verdicts.
+// ManifestOf builds a manifest from verdicts. Policies are the verdicts' own,
+// never this package's: regenerating old verdicts under a newer policy must
+// leave them stale. The manifest's Policy is the most common one; an entry of
+// another policy records its own.
 func ManifestOf(verdicts []Verdict) Manifest {
-	m := Manifest{Policy: Policy, Entries: make(map[string]Entry, len(verdicts))}
+	m := Manifest{Entries: make(map[string]Entry, len(verdicts))}
+	counts := map[string]int{}
 	for _, v := range verdicts {
-		if m.Model == "" {
-			m.Model = v.Model
+		counts[v.Policy]++
+		if counts[v.Policy] > counts[m.Policy] || (counts[v.Policy] == counts[m.Policy] && v.Policy < m.Policy) {
+			m.Policy = v.Policy
 		}
-		m.Entries[v.Key] = Entry{Fingerprint: v.Fingerprint, Class: v.Class, Declared: v.Declared, Risk: round3(v.Risk())}
+	}
+	for i, v := range verdicts {
+		// Model is provenance only; a run that mixed models names none.
+		if i == 0 {
+			m.Model = v.Model
+		} else if v.Model != m.Model {
+			m.Model = ""
+			break
+		}
+	}
+	for _, v := range verdicts {
+		e := Entry{Fingerprint: v.Fingerprint, Class: v.Class, Declared: v.Declared, Risk: round3(v.Risk())}
+		if v.Policy != m.Policy {
+			e.Policy = v.Policy
+			if e.Policy == "" {
+				e.Policy = "unknown"
+			}
+		}
+		m.Entries[v.Key] = e
 	}
 	return m
 }
@@ -49,7 +75,11 @@ func (m Manifest) verdict(key string) (Verdict, bool) {
 	if !ok || !e.Class.Valid() {
 		return Verdict{}, false
 	}
-	return Verdict{Key: key, Fingerprint: e.Fingerprint, Policy: m.Policy, Model: m.Model, Class: e.Class, Declared: e.Declared}, true
+	policy := m.Policy
+	if e.Policy != "" {
+		policy = e.Policy
+	}
+	return Verdict{Key: key, Fingerprint: e.Fingerprint, Policy: policy, Model: m.Model, Class: e.Class, Declared: e.Declared}, true
 }
 
 // Catalog serves verdicts on the request path without calling the model, and
@@ -76,6 +106,7 @@ type Catalog struct {
 	cache    map[catalogKey]Verdict
 	checked  map[catalogKey]time.Time
 	queue    map[catalogKey]queued
+	failures map[catalogKey]failure
 	order    []catalogKey
 	maxQueue int
 	maxCache int
@@ -84,8 +115,15 @@ type Catalog struct {
 type catalogKey struct{ source, key string }
 
 type queued struct {
-	tool     Tool
-	attempts int
+	tool Tool
+}
+
+// failure remembers a tool whose review keeps failing, across dequeues, so the
+// request path cannot re-queue it into a retry loop.
+type failure struct {
+	until       time.Time
+	fingerprint string
+	attempts    int
 }
 
 // recheckStoreAfter is how long a key the store did not have (or had stale) is
@@ -93,8 +131,13 @@ type queued struct {
 // review is picked up without a query per lookup.
 const recheckStoreAfter = time.Minute
 
-// maxAttempts bounds retries of a tool whose review keeps failing.
+// maxAttempts is how many failed reviews in a row move a tool to the long
+// backoff (failedBackoff) instead of the short one.
 const maxAttempts = 3
+
+// failedBackoff is how long a tool whose review failed maxAttempts times is
+// left alone. A changed tool (new fingerprint) is retried at once.
+const failedBackoff = time.Hour
 
 // CatalogOption configures a Catalog.
 type CatalogOption func(*Catalog)
@@ -138,6 +181,7 @@ func NewCatalog(reviewer *Reviewer, store Store, opts ...CatalogOption) *Catalog
 		cache:     map[catalogKey]Verdict{},
 		checked:   map[catalogKey]time.Time{},
 		queue:     map[catalogKey]queued{},
+		failures:  map[catalogKey]failure{},
 		maxQueue:  20000,
 		maxCache:  100000,
 	}
@@ -193,14 +237,21 @@ func (c *Catalog) Verdicts(ctx context.Context, source string, tools []Tool) map
 		}
 		k := catalogKey{source, t.Key}
 		if asked[t.Key] {
+			if len(c.checked) >= c.maxCache {
+				clear(c.checked)
+			}
 			c.checked[k] = now
 			if v, ok := stored[t.Key]; ok && v.Class.Valid() {
-				c.remember(k, v)
+				// A stale stored verdict never replaces a cached one: with
+				// several writers it may be older and less cautious.
+				if _, cached := c.cache[k]; !cached || v.Current(t) {
+					c.remember(k, v)
+				}
 			}
 		}
 		v, ok := c.cache[k]
-		if !ok {
-			v, ok = c.fallbacks[source].verdict(t.Key)
+		if fb, fok := c.fallbacks[source].verdict(t.Key); fok && (!ok || (!v.Current(t) && fb.Current(t))) {
+			v, ok = fb, true
 		}
 		if ok && v.Current(t) {
 			c.remember(k, v)
@@ -220,19 +271,34 @@ func (c *Catalog) Verdicts(ctx context.Context, source string, tools []Tool) map
 // On failure it returns the best stale verdict it has (Stale set), or none,
 // with the error; the tool stays queued.
 func (c *Catalog) Review(ctx context.Context, source string, t Tool) (Verdict, error) {
+	if c == nil {
+		return Verdict{Declared: t.Declared}, errNoReviewer
+	}
 	got := c.Verdicts(ctx, source, []Tool{t})
 	best, have := got[t.Key]
 	if have && !best.Stale {
 		return best, nil
 	}
-	v, err := c.reviewAndSave(ctx, source, t)
-	if err != nil {
-		return best, err
-	}
-	c.mu.Lock()
 	k := catalogKey{source, t.Key}
-	delete(c.queue, k)
+	c.mu.Lock()
+	backedOff := c.backedOffLocked(k, t)
 	c.mu.Unlock()
+	if backedOff {
+		return withDeclared(best, t), ErrBackoff
+	}
+	v, err := c.reviewAndSave(ctx, source, t)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err != nil {
+		// Neither a cancelled call nor a missing reviewer says anything about
+		// the tool; only a failed review backs it off.
+		if !cancelled(err) && !errors.Is(err, errNoReviewer) {
+			c.failedLocked(k, t)
+		}
+		return withDeclared(best, t), err
+	}
+	delete(c.queue, k)
+	delete(c.failures, k)
 	return withDeclared(v, t), nil
 }
 
@@ -257,6 +323,12 @@ func (c *Catalog) enqueueLocked(k catalogKey, t Tool) {
 	if t.Key == "" || t.Name == "" {
 		return
 	}
+	if c.backedOffLocked(k, t) {
+		return
+	}
+	if len(c.order) > 2*len(c.queue)+64 {
+		c.compactLocked()
+	}
 	if q, ok := c.queue[k]; ok {
 		q.tool = t
 		c.queue[k] = q
@@ -267,6 +339,55 @@ func (c *Catalog) enqueueLocked(k catalogKey, t Tool) {
 	}
 	c.queue[k] = queued{tool: t}
 	c.order = append(c.order, k)
+}
+
+// backedOffLocked reports whether t's last reviews failed recently enough
+// that it must not be sent to the model again yet.
+func (c *Catalog) backedOffLocked(k catalogKey, t Tool) bool {
+	f, ok := c.failures[k]
+	return ok && f.fingerprint == Fingerprint(t) && c.now().Before(f.until)
+}
+
+func (c *Catalog) compactLocked() {
+	live := c.order[:0]
+	for _, k := range c.order {
+		if _, ok := c.queue[k]; ok {
+			live = append(live, k)
+		}
+	}
+	clear(c.order[len(live):])
+	c.order = live
+}
+
+// failedLocked records a failed review and its backoff: a minute per attempt,
+// then failedBackoff once the attempts run out.
+func (c *Catalog) failedLocked(k catalogKey, t Tool) {
+	if t.Key == "" || t.Name == "" {
+		return
+	}
+	fp := Fingerprint(t)
+	f := c.failures[k]
+	if f.fingerprint != fp {
+		f = failure{fingerprint: fp}
+	}
+	f.attempts++
+	wait := time.Duration(f.attempts) * time.Minute
+	if f.attempts >= maxAttempts {
+		wait = failedBackoff
+	}
+	f.until = c.now().Add(wait)
+	if len(c.failures) >= c.maxQueue {
+		now := c.now()
+		for fk, f := range c.failures {
+			if !now.Before(f.until) {
+				delete(c.failures, fk)
+			}
+		}
+		if len(c.failures) >= c.maxQueue {
+			clear(c.failures)
+		}
+	}
+	c.failures[k] = f
 }
 
 // Pending is the number of queued tools.
@@ -307,6 +428,12 @@ func (c *Catalog) Drain(ctx context.Context, max, concurrency int) DrainStats {
 		if !ok {
 			continue
 		}
+		if c.backedOffLocked(k, q.tool) {
+			// Queued before its review failed elsewhere; Verdicts re-queues
+			// it once the backoff ends.
+			delete(c.queue, k)
+			continue
+		}
 		if len(batch) < max {
 			batch = append(batch, item{k, q})
 			delete(c.queue, k)
@@ -314,6 +441,7 @@ func (c *Catalog) Drain(ctx context.Context, max, concurrency int) DrainStats {
 		}
 		rest = append(rest, k)
 	}
+	clear(c.order[len(rest):])
 	c.order = rest
 	c.mu.Unlock()
 
@@ -347,12 +475,19 @@ func (c *Catalog) Drain(ctx context.Context, max, concurrency int) DrainStats {
 			stats.Cost += v.Cost
 			if err != nil {
 				stats.Failed++
-				it.q.attempts++
-				if it.q.attempts < maxAttempts {
+				if cancelled(err) {
+					// The run ended, not the review: try again next time.
 					c.requeue(it.k, it.q)
+					return
 				}
+				c.mu.Lock()
+				c.failedLocked(it.k, it.q.tool)
+				c.mu.Unlock()
 				return
 			}
+			c.mu.Lock()
+			delete(c.failures, it.k)
+			c.mu.Unlock()
 			stats.Reviewed++
 			if withDeclared(v, it.q.tool).Raised() {
 				stats.Raised++
@@ -366,7 +501,7 @@ func (c *Catalog) Drain(ctx context.Context, max, concurrency int) DrainStats {
 func (c *Catalog) requeue(k catalogKey, q queued) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.queue[k]; ok {
+	if _, ok := c.queue[k]; ok || len(c.queue) >= c.maxQueue {
 		return
 	}
 	c.queue[k] = q
@@ -396,10 +531,28 @@ func (c *Catalog) reviewAndSave(ctx context.Context, source string, t Tool) (Ver
 
 func (c *Catalog) remember(k catalogKey, v Verdict) {
 	if _, ok := c.cache[k]; !ok && len(c.cache) >= c.maxCache {
-		clear(c.cache)
+		c.evictLocked()
 	}
 	v.Stale = false
 	c.cache[k] = v
+}
+
+// evictLocked frees a quarter of the cache, dropping verdicts that hold
+// nothing before any that do: without a store, a dropped hold is gone until
+// the tool is reviewed again.
+func (c *Catalog) evictLocked() {
+	target := len(c.cache) - c.maxCache*3/4
+	for _, holds := range []bool{false, true} {
+		for k, v := range c.cache {
+			if target <= 0 {
+				return
+			}
+			if v.Class.RequiresApproval() == holds {
+				delete(c.cache, k)
+				target--
+			}
+		}
+	}
 }
 
 func (c *Catalog) report(source, key string, err error) {
@@ -408,11 +561,19 @@ func (c *Catalog) report(source, key string, err error) {
 	}
 }
 
+// ErrBackoff means the tool's recent reviews failed and it is not sent to the
+// model again until its backoff ends. Review returns the best verdict it has.
+var ErrBackoff = errors.New("toolreview: tool review is backing off after failures")
+
 type reviewerError string
 
 func (e reviewerError) Error() string { return string(e) }
 
 const errNoReviewer = reviewerError("toolreview: catalog has no reviewer")
+
+func cancelled(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
 
 func withDeclared(v Verdict, t Tool) Verdict {
 	v.Declared = t.Declared
@@ -428,4 +589,18 @@ func max1(n int) int {
 
 func round3(f float64) float64 {
 	return float64(int(f*1000+0.5)) / 1000
+}
+
+// Holds returns the entries whose review makes the tool need approval when
+// its provider's own label does not: the verdicts that change a gate's
+// decision. A compiled-in fallback usually needs only these; a tool missing
+// from it is reviewed when first seen.
+func (m Manifest) Holds() Manifest {
+	out := Manifest{Policy: m.Policy, Model: m.Model, Entries: make(map[string]Entry)}
+	for k, e := range m.Entries {
+		if Max(e.Declared, e.Class).RequiresApproval() && !e.Declared.RequiresApproval() {
+			out.Entries[k] = e
+		}
+	}
+	return out
 }

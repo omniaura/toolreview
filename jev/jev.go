@@ -36,6 +36,9 @@ const (
 	maxQuestions          = 32
 )
 
+// ErrNotConfigured means the client has no API key. Retrying cannot help.
+var ErrNotConfigured = errors.New("jev: API key is not configured")
+
 // ErrNoAnswer means the response did not answer the question asked.
 var ErrNoAnswer = errors.New("jev: no answer for question")
 
@@ -174,11 +177,11 @@ type wireAnswer struct {
 // it did not offer.
 func (c *Client) Ask(ctx context.Context, state any, questions map[string]Question) (Batch, error) {
 	if c == nil || c.apiKey == nil {
-		return Batch{}, errors.New("jev: client is not configured")
+		return Batch{}, ErrNotConfigured
 	}
 	key := strings.TrimSpace(c.apiKey())
 	if key == "" {
-		return Batch{}, errors.New("jev: API key is not configured")
+		return Batch{}, ErrNotConfigured
 	}
 	if len(questions) == 0 || len(questions) > maxQuestions {
 		return Batch{}, fmt.Errorf("jev: one to %d questions required", maxQuestions)
@@ -272,4 +275,55 @@ func truncate(b []byte, limit int) string {
 		return string(b)
 	}
 	return string(b[:limit]) + "…"
+}
+
+// maxRetryPause caps the pause between attempts.
+const maxRetryPause = 10 * time.Second
+
+// Retry returns a Chooser that sends a failed call again, up to attempts
+// times in all, with a growing pause; a rejection that cannot succeed on retry
+// (a 4xx other than 429, or a missing key) is returned at once; an answer
+// with no declared label is asked again. The cost of every attempt is
+// reported.
+func Retry(c *Client, attempts int) toolreview.Chooser {
+	if c == nil {
+		c = New(nil)
+	}
+	return retrying{c: c, attempts: max(1, attempts)}
+}
+
+type retrying struct {
+	c        *Client
+	attempts int
+}
+
+func (r retrying) Choose(ctx context.Context, state any, instructions string, criteria map[string]string) (toolreview.Choice, error) {
+	var last error
+	var cost float64
+	for attempt := range r.attempts {
+		if err := ctx.Err(); err != nil {
+			return toolreview.Choice{Model: r.c.model, Cost: cost}, err
+		}
+		if attempt > 0 {
+			t := time.NewTimer(min(time.Duration(attempt*attempt)*time.Second, maxRetryPause))
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return toolreview.Choice{Model: r.c.model, Cost: cost}, ctx.Err()
+			case <-t.C:
+			}
+		}
+		choice, err := r.c.Choose(ctx, state, instructions, criteria)
+		cost += choice.Cost
+		if err == nil {
+			choice.Cost = cost
+			return choice, nil
+		}
+		last = err
+		var httpErr *HTTPError
+		if errors.Is(err, ErrNotConfigured) || (errors.As(err, &httpErr) && !httpErr.Retryable()) {
+			break
+		}
+	}
+	return toolreview.Choice{Model: r.c.model, Cost: cost}, last
 }

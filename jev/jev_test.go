@@ -71,3 +71,23 @@ func TestHTTPErrorIsTyped(t *testing.T) {
 		t.Fatal("a missing key must fail before any request")
 	}
 }
+
+func TestRetryAsksAgainAfterNoAnswer(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		if calls == 1 {
+			_, _ = w.Write([]byte(`{"answers":{"choice":{"choice":"invented"}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"answers":{"choice":{"choice":"a","probabilities":{"a":1}}}}`))
+	}))
+	defer srv.Close()
+	got, err := Retry(New(func() string { return "k" }, WithURL(srv.URL)), 3).Choose(t.Context(), nil, "q", map[string]string{"a": "", "b": ""})
+	if err != nil || calls != 2 || got.Probabilities["a"] != 1 {
+		t.Fatalf("calls=%d got=%#v err=%v", calls, got, err)
+	}
+	if c, err := Retry(nil, 3).Choose(t.Context(), nil, "q", map[string]string{"a": "", "b": ""}); !errors.Is(err, ErrNotConfigured) || c.Model != DefaultModel {
+		t.Fatalf("nil client: %#v %v", c, err)
+	}
+}

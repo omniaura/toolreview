@@ -74,8 +74,8 @@ func collectArguments(out *[]Argument, node schemaNode, prefix string, depth int
 			desc = strings.TrimSpace(prop.Title)
 		}
 		*out = append(*out, Argument{
-			Name:        full,
-			Type:        schemaType(prop),
+			Name:        clip(full, maxNameRunes),
+			Type:        clip(schemaType(prop), 60),
 			Description: clip(desc, maxArgumentRunes),
 			Enum:        enumValues(prop.Enum),
 			Required:    required[name] && prefix == "",
@@ -111,7 +111,10 @@ func schemaType(n schemaNode) string {
 	}
 	for _, alts := range [][]schemaNode{n.AnyOf, n.OneOf} {
 		var types []string
-		for _, alt := range alts {
+		for i, alt := range alts {
+			if i == maxEnumValues {
+				break
+			}
 			if t := schemaType(alt); t != "" && t != "null" {
 				types = append(types, t)
 			}

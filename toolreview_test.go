@@ -549,3 +549,22 @@ func TestManifestHolds(t *testing.T) {
 		t.Fatalf("holds = %v", got)
 	}
 }
+
+func TestNoReviewerIsNotABackoff(t *testing.T) {
+	c := NewCatalog(nil, nil)
+	tool := Tool{Key: "A", Name: "A"}
+	for range maxAttempts + 1 {
+		if _, err := c.Review(t.Context(), "s", tool); !errors.Is(err, errNoReviewer) {
+			t.Fatalf("err = %v, want the configuration error", err)
+		}
+	}
+}
+
+func TestRequeueRespectsTheQueueLimit(t *testing.T) {
+	c := NewCatalog(nil, nil, WithLimits(1, 0))
+	c.Enqueue("s", Tool{Key: "A", Name: "A"})
+	c.requeue(catalogKey{"s", "B"}, queued{tool: Tool{Key: "B", Name: "B"}})
+	if c.Pending() != 1 {
+		t.Fatalf("pending = %d, want the limit 1", c.Pending())
+	}
+}

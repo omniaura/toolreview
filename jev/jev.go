@@ -277,13 +277,17 @@ func truncate(b []byte, limit int) string {
 	return string(b[:limit]) + "…"
 }
 
+// maxRetryPause caps the pause between attempts.
+const maxRetryPause = 10 * time.Second
+
 // Retry returns a Chooser that sends a failed call again, up to attempts
 // times in all, with a growing pause; a rejection that cannot succeed on retry
-// (a 4xx other than 429) is returned at once. The cost of every attempt is
+// (a 4xx other than 429, or a missing key) is returned at once; an answer
+// with no declared label is asked again. The cost of every attempt is
 // reported.
 func Retry(c *Client, attempts int) toolreview.Chooser {
 	if c == nil {
-		c = &Client{}
+		c = New(nil)
 	}
 	return retrying{c: c, attempts: max(1, attempts)}
 }
@@ -301,7 +305,7 @@ func (r retrying) Choose(ctx context.Context, state any, instructions string, cr
 			return toolreview.Choice{Model: r.c.model, Cost: cost}, err
 		}
 		if attempt > 0 {
-			t := time.NewTimer(time.Duration(attempt*attempt) * time.Second)
+			t := time.NewTimer(min(time.Duration(attempt*attempt)*time.Second, maxRetryPause))
 			select {
 			case <-ctx.Done():
 				t.Stop()
@@ -317,7 +321,7 @@ func (r retrying) Choose(ctx context.Context, state any, instructions string, cr
 		}
 		last = err
 		var httpErr *HTTPError
-		if errors.Is(err, ErrNotConfigured) || errors.Is(err, ErrNoAnswer) || (errors.As(err, &httpErr) && !httpErr.Retryable()) {
+		if errors.Is(err, ErrNotConfigured) || (errors.As(err, &httpErr) && !httpErr.Retryable()) {
 			break
 		}
 	}

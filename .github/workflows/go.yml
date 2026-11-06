@@ -23,7 +23,7 @@ jobs:
       - name: go mod tidy
         run: |
           GOWORK=off go mod tidy
-          git diff --exit-code -- go.mod
+          test -z "$(git status --porcelain -- go.mod go.sum)" || (git status --porcelain -- go.mod go.sum && exit 1)
       - name: vet
         run: go vet ./...
       - name: test

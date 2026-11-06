@@ -290,7 +290,9 @@ func (c *Catalog) Review(ctx context.Context, source string, t Tool) (Verdict, e
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if err != nil {
-		if !cancelled(err) {
+		// Neither a cancelled call nor a missing reviewer says anything about
+		// the tool; only a failed review backs it off.
+		if !cancelled(err) && !errors.Is(err, errNoReviewer) {
 			c.failedLocked(k, t)
 		}
 		return withDeclared(best, t), err
@@ -499,7 +501,7 @@ func (c *Catalog) Drain(ctx context.Context, max, concurrency int) DrainStats {
 func (c *Catalog) requeue(k catalogKey, q queued) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.queue[k]; ok {
+	if _, ok := c.queue[k]; ok || len(c.queue) >= c.maxQueue {
 		return
 	}
 	c.queue[k] = q
